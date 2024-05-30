@@ -1,0 +1,364 @@
+#!/bin/zsh
+
+export LC_ALL="C"
+
+# LOGLEVELS:
+#   0 CRITICAL
+#   1 ERROR
+#   2 WARNING
+#   3 INFO
+#   4 VERBOSE
+if [ -z "$LOGLEVEL" ] ; then
+  LOGLEVEL=2
+fi
+
+# Why is there no tool that can do this safely?
+replace_all() {
+  python3 -c "import sys; print(sys.stdin.read().replace(sys.argv[1], sys.argv[2]), end='')" "$1" "$2"
+}
+
+LOGFILE=""
+if [ "$LOGLEVEL" -ge 0 ] ; then
+  log_critical() {
+    if [ ! -z "$LOGFILE" ] ; then
+      echo "[CRITICAL]" "$@" > $LOGFILE
+    fi
+    echo "$(tput setaf 1)[CRITICAL]" "$@" "$(tput sgr0)" >&2
+  }
+else
+  log_critical() {}
+fi
+
+if [ "$LOGLEVEL" -ge 1 ] ; then
+  log_error() {
+    if [ ! -z "$LOGFILE" ] ; then
+      echo "[ERROR]" "$@" > $LOGFILE
+    fi
+    echo "$(tput setaf 1)[ERROR]" "$@" "$(tput sgr0)" >&2
+  }
+else
+  log_error() {}
+fi
+
+if [ "$LOGLEVEL" -ge 2 ] ; then
+  log_warn() {
+    if [ ! -z "$LOGFILE" ] ; then
+      echo "[WARNING]" "$@" > $LOGFILE
+    fi
+    echo "$(tput setaf 3)[WARNING]" "$@" "$(tput sgr0)" >&2
+  }
+else
+  log_warn() {}
+fi
+
+if [ "$LOGLEVEL" -ge 3 ] ; then
+  log_info() {
+    if [ ! -z "$LOGFILE" ] ; then
+      echo "[INFO]" "$@" > $LOGFILE
+    fi
+    echo "$(tput setaf 4)[INFO]" "$@" "$(tput sgr0)" >&2
+  }
+else
+  log_info() {}
+fi
+
+if [ "$LOGLEVEL" -ge 4 ] ; then
+  echo "hi"
+  log_verbose() {
+    if [ ! -z "$LOGFILE" ] ; then
+      echo "[DEBUG]" "$@" > $LOGFILE
+    fi
+    echo "$(tput setaf 5)[DEBUG]" "$@" "$(tput sgr0)" >&2
+  }
+else
+  log_verbose() {}
+fi
+
+DOLLAR_ZERO="$0"
+usage() {
+  echo "$DOLLAR_ZERO" "[-a] [FILES...]\n\
+Loads pipewire links and unlinks from one or more files and/or config files.\n\
+\n\
+If -a is given, loads files in pipewire-links.conf.d/ in common pipewire config directories. Files given on the command line are loaded after the config files.\n\
+\n\
+Options:\n\
+  --help\tPrints this help text.\n\
+  -a\tLoads (un-)links from pipewire-links.conf.d directories.\n\
+\n\
+File format:\n\
+  Each non-empty line represents a variable assignment, a link, or an unlink.\n\
+\n\
+  Variable assignments are one of the following two forms, where variables are file-local after the assignment and global variables are in scope in all files loaded after the file of the assignment and in the same file after the assignment:\n\
+    variable_name = value\n\
+    global global_variable_name = value\n\
+\n\
+  (Un-)links are of the following two forms, where -> is a link and -/-> is an unlink:\n\
+    link_from -> link_to\n\
+    unlink_from -/-> unlink_to\n\
+\n\
+  (Un-)links may also be specified in multi-line, which is desugared to the previous syntax:\n\
+    link_from\n\
+      |-> link_to\n\
+      |-/-> unlink_to\n\
+      |-> link2_to"
+}
+
+CONFIG_HOME="$XDG_CONFIG_HOME"
+if [ -z "$CONFIG_HOME" ] ; then
+  CONFIG_HOME="$HOME/.config"
+fi
+CONFIG_PREFIX="$PIPEWIRE_CONFIG_PREFIX"
+if [ -z "$CONFIG_PREFIX" ] ; then
+  CONFIG_PREFIX="pipewire"
+fi
+RELATIVE_CONF_D="$CONFIG_PREFIX/pipewire-links.conf.d"
+
+FILES=()
+USER_FILES=()
+LOAD_CONFIG_FILES=0
+FILES_NOT_FOUND=0
+DRY_RUN=0
+
+for arg in "$@" ; do
+  if [[ "$arg" == "--help" ]] ; then
+    usage
+    exit 1
+  fi
+done
+
+for arg in "$@" ; do
+  if [[ "$arg" == "-a" ]] ; then
+    log_verbose "Will load links from config files."
+    LOAD_CONFIG_FILES=1
+  elif [[ "$arg" == "--dry" ]] || [[ "$arg" == "--dry-run" ]] ; then
+    DRY_RUN=1
+  else
+    USER_FILES+=("$arg")
+    if [ ! -f "$arg" ] ; then
+      log_error "$arg: File not found"
+      FILES_NOT_FOUND=1
+    fi
+  fi
+done
+
+if [ $FILES_NOT_FOUND -ne 0 ] ; then
+  log_critical "Some files were not found. Will not continue."
+  exit 1
+fi
+
+if [ "${#USER_FILES}" -eq 0 ] && [ "$LOAD_CONFIG_FILES" -eq 0 ] ; then
+  log_critical "Links were not loaded from config (-a flag not given), but no files were given either!"
+  exit 1
+fi
+
+if [ "$LOAD_CONFIG_FILES" -ne 0 ] ; then
+  for d in "$PIPEWIRE_CONFIG_DIR/$RELATIVE_CONF_D" \
+           "$CONFIG_HOME/$RELATIVE_CONF_D" \
+           "/etc/$RELATIVE_CONF_D" \
+           "/usr/share/$RELATIVE_CONF_D" \
+           ; do
+    log_verbose "Checking for configs in $d"
+    if [ -d "$d" ] ; then
+      log_verbose "Config directory $d exists"
+      IFS=$'\n'
+      for f in $(find "$d" -maxdepth 1 -type f -iname "*.conf" | sort) ; do
+        log_info "Found $f"
+        FILES+=("$f")
+      done
+    fi
+  done
+fi
+
+for f in ${USER_FILES[@]} ; do
+  FILES+="$f"
+done
+
+alias trim="sed 's/^\s\+//;s/\s\+$//'"
+
+ANY_FAILED=0
+
+GLOBAL_VARS=()
+LINKS=()
+UNLINKS=()
+for f in ${FILES[@]} ; do
+  log_verbose "Reading file $f"
+  # echo "Linking $f..."
+
+  VARS=()
+  IFS=$'\n'
+  CONTENT=""
+
+  # Pre-process
+  last_line=""
+  cat "$f" | trim | while read -r line ; do
+    if echo "$line" | grep --silent '^|-/->' ; then
+      log_verbose "found multi-line unlink: $line"
+      # duplicate last line
+      LINK_TO="$(echo $line | sed 's/|-\/->//' | trim)"
+
+      if echo "$last_line" | grep -v --silent '.*-/->.*\|.*->.*\|.*=.*' ; then
+        # Remove last line.
+        log_verbose "Removing line for multi-line (un-)link desugaring: $last_line"
+        CONTENT="$(echo "$CONTENT" | head -n-1)"
+      elif echo "$last_line" | grep --silent '.*=.*' ; then
+        log_critical "Cannot continue parsing. Error in multi-line (un-)link in $f: Multi-line (un-)link after variable"
+        exit 1
+      fi
+
+      line="$(echo $last_line | sed 's/->/>/g' | cut -d'>' -f1 | trim) -/-> $LINK_TO"
+
+      CONTENT="$CONTENT\n$line"
+    elif echo "$line" | grep --silent '^|->' ; then
+      log_verbose "found multi-line link: $line"
+      # duplicate last line
+      LINK_TO="$(echo $line | sed 's/|->//' | trim)"
+
+      if echo "$last_line" | grep -v --silent '.*-/->.*\|.*->.*\|.*=.*' ; then
+        # Remove last line.
+        log_verbose "Removing line for multi-line (un-)link desugaring: $last_line"
+        CONTENT="$(echo "$CONTENT" | head -n-1)"
+      elif echo "$last_line" | grep --silent '.*=.*' ; then
+        log_critical "Cannot continue parsing. Error in multi-line (un-)link in $f: Multi-line (un-)link after variable"
+        exit 1
+      fi
+
+      line="$(echo $last_line | sed 's/->/>/g' | cut -d'>' -f1 | trim) -> $LINK_TO"
+
+      CONTENT="$CONTENT\n$line"
+    else
+      CONTENT="$CONTENT\n$line"
+    fi
+
+    last_line="$line"
+  done
+
+  log_verbose "desugared: $CONTENT"
+  
+  echo "$CONTENT" | while read -r line ; do
+    if echo "$line" | grep --silent '.*=.*' ; then
+      IS_GLOBAL=0
+      if echo "$line" | grep --silent '^global\s' ; then
+        IS_GLOBAL=1
+        line="$(echo $line | sed 's/^global\s//' | trim)"
+      fi
+
+      for var in ${VARS[@]} ; do
+        # replace vars
+        VARNAME="$(echo "$var" | cut -d'|' -f1)"
+        VARVALUE="$(echo "$var" | cut -d'|' -f2-)"
+        line="$(echo "$line" | replace_all "\$$VARNAME" "$VARVALUE")"
+      done
+
+      for var in ${GLOBAL_VARS[@]} ; do
+        # replace vars
+        VARNAME="$(echo "$var" | cut -d'|' -f1)"
+        VARVALUE="$(echo "$var" | cut -d'|' -f2-)"
+        line="$(echo "$line" | replace_all "\$$VARNAME" "$VARVALUE")"
+      done
+
+      VARNAME="$(echo $line | cut -d= -f1 | trim)"
+      VARVALUE="$(echo $line | cut -d= -f2- | trim)"
+
+      # echo "var-line {$VARNAME, $VARVALUE}"
+      if [ $IS_GLOBAL -eq 0 ] ; then
+        VARS+=("$VARNAME|$VARVALUE")
+        log_verbose "Added var $VARNAME = $VARVALUE"
+      else
+        GLOBAL_VARS+=("$VARNAME|$VARVALUE")
+        log_verbose "Added global var $VARNAME = $VARVALUE"
+      fi
+    elif echo "$line" | grep --silent '.*-/->.*' ; then
+      for var in ${VARS[@]} ; do
+        # replace vars
+        VARNAME="$(echo "$var" | cut -d'|' -f1)"
+        VARVALUE="$(echo "$var" | cut -d'|' -f2-)"
+        line="$(echo "$line" | replace_all "\$$VARNAME" "$VARVALUE")"
+      done
+
+      for var in ${GLOBAL_VARS[@]} ; do
+        # replace vars
+        VARNAME="$(echo "$var" | cut -d'|' -f1)"
+        VARVALUE="$(echo "$var" | cut -d'|' -f2-)"
+        line="$(echo "$line" | replace_all "\$$VARNAME" "$VARVALUE")"
+      done
+
+      line="$(echo $line | sed 's/-\/->/>/g')"
+
+      LINK_FROM="$(echo "$line" | cut -d'>' -f1 | trim)"
+      LINK_TO="$(echo "$line" | cut -d'>' -f2- | trim)"
+
+      # echo "link-line {$LINK_FROM, $LINK_TO}"
+      UNLINKS+=("$LINK_FROM|$LINK_TO")
+      log_verbose "Added to the list unlink $LINK_FROM -> $LINK_TO"
+    elif echo "$line" | grep --silent '.*->.*' ; then
+      for var in ${VARS[@]} ; do
+        # replace vars
+        VARNAME="$(echo "$var" | cut -d'|' -f1)"
+        VARVALUE="$(echo "$var" | cut -d'|' -f2-)"
+        line="$(echo "$line" | replace_all "\$$VARNAME" "$VARVALUE")"
+      done
+
+      for var in ${GLOBAL_VARS[@]} ; do
+        # replace vars
+        VARNAME="$(echo "$var" | cut -d'|' -f1)"
+        VARVALUE="$(echo "$var" | cut -d'|' -f2-)"
+        line="$(echo "$line" | replace_all "\$$VARNAME" "$VARVALUE")"
+      done
+
+      line="$(echo $line | sed 's/->/>/g')"
+
+      LINK_FROM="$(echo "$line" | cut -d'>' -f1 | trim)"
+      LINK_TO="$(echo "$line" | cut -d'>' -f2- | trim)"
+
+      # echo "link-line {$LINK_FROM, $LINK_TO}"
+      LINKS+=("$LINK_FROM|$LINK_TO")
+      log_verbose "Added to the list link $LINK_FROM -> $LINK_TO"
+    else
+      if ! [ -z "$(echo "$line" | trim)" ] ; then
+        log_error "Error: Couldn't parse line: $line"
+      fi
+    fi
+  done
+done
+
+log_verbose "Linking..."
+
+for link in ${LINKS[@]} ; do
+  LINK_FROM="$(echo "$link" | cut -d'|' -f1)"
+  LINK_TO="$(echo "$link" | cut -d'|' -f2-)"
+  # echo "linking from $LINK_FROM to $LINK_TO..." > $LOGFILE
+  log_info "Linking $LINK_FROM -> $LINK_TO"
+  if [ "$DRY_RUN" -eq 0 ] ; then
+    RESULT="$(pw-link "$LINK_FROM" "$LINK_TO" 2>&1)"
+    if [[ "$RESULT" == "failed to link ports: File exists" ]] ; then
+      # ignore!
+      log_info "$LINK_FROM -> $LINK_TO already exists"
+    else
+      log_error "$LINK_FROM -> $LINK_TO failed: $RESULT"
+      ANY_FAILED=1
+    fi
+  fi
+done
+
+for link in ${UNLINKS[@]} ; do
+  LINK_FROM="$(echo "$link" | cut -d'|' -f1)"
+  LINK_TO="$(echo "$link" | cut -d'|' -f2-)"
+  # echo "linking from $LINK_FROM to $LINK_TO..." > $LOGFILE
+  log_info "Unlinking $LINK_FROM -> $LINK_TO"
+  if [ "$DRY_RUN" -eq 0 ] ; then
+    RESULT="$(pw-link -d "$LINK_FROM" "$LINK_TO" 2>&1)"
+    if [[ "$RESULT" == "failed to unlink ports: No such file or directory" ]] ; then
+      # ignore!
+      log_info "$LINK_FROM -> $LINK_TO already deleted"
+    else
+      log_error "$LINK_FROM -> $LINK_TO failed: $RESULT"
+      ANY_FAILED=1
+    fi
+  fi
+done
+
+if [ "$ANY_FAILED" -ne 0 ] ; then
+  exit 2
+else
+  exit 0
+fi
